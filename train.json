@@ -1,0 +1,28 @@
+[
+  {
+    "id": "video_fake_sample_01",
+    "conversations": [
+      {
+        "role": "user",
+        "value": "/data/srq/Qwen/Qwen2.5-VL/imgs/fake_video_01.mp4"
+      },
+      {
+        "role": "assistant",
+        "value": "<think>\n1. Motion Consistency: The clouds in the background are moving too fast compared to the water, which looks unnatural.\n2. Lighting Consistency: The reflection on the water does not match the sun's position.\n3. Texture Artifacts: The trees have a blurry, oil-painting like texture typical of GANs.\n4. Physics Violations: None observed.\nOverall, the texture and motion anomalies suggest AI generation.\n</think>\n<answer> Generated </answer>"
+      }
+    ]
+  },
+  {
+    "id": "video_real_sample_01",
+    "conversations": [
+      {
+        "role": "user",
+        "value": "/data/srq/Qwen/Qwen2.5-VL/imgs/real_video_01.mp4"
+      },
+      {
+        "role": "assistant",
+        "value": "<think>\n1. Motion Consistency: The person's walking gait is natural and has weight.\n2. Lighting Consistency: Shadows are sharp and strictly follow the street lamps.\n3. Texture Artifacts: Skin pores and fabric textures are highly detailed and irregular, consistent with reality.\n4. Physics Violations: Gravity affects the clothing folds naturally.\nNo signs of generation detected.\n</think>\n<answer> Real </answer>"
+      }
+    ]
+  }
+]
