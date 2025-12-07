@@ -1,228 +1,252 @@
 import torch
+import json
+import os
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Sequence
 from datasets import Dataset
-from modelscope import snapshot_download, AutoTokenizer
-from swanlab.integration.transformers import SwanLabCallback
-from qwen_vl_utils import process_vision_info
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+import transformers
 from transformers import (
     TrainingArguments,
     Trainer,
-    DataCollatorForSeq2Seq,
-    Qwen2_5_VLForConditionalGeneration, # 替换为 Qwen2.5
+    Qwen2_5_VLForConditionalGeneration, 
     AutoProcessor,
+    AutoTokenizer
 )
+from peft import LoraConfig, TaskType, get_peft_model
+from qwen_vl_utils import process_vision_info
 import swanlab
-import json
-import os
+from swanlab.integration.transformers import SwanLabCallback
+from transformers import AutoConfig
 
-# --- 配置部分 ---
-# 根据你的文件结构，修改模型路径为相对路径或绝对路径
-# 你的结构: Qwen/Qwen2.5-VL/train.py (当前位置) -> Qwen/Qwen/Qwen2.5-VL-7B-Instruct (模型位置)
-local_model_path = "../Qwen/Qwen2.5-VL-7B-Instruct"  # 或者使用绝对路径 /data/srq/Qwen/Qwen/Qwen2.5-VL-7B-Instruct
-train_dataset_json_path = "train.json"
-output_dir = "./output/Qwen2.5-VL-VidGuard-CoT" # 修改输出目录名以区分
-MAX_LENGTH = 4096
+# --- 1. 配置区域 ---
+# 建议使用绝对路径
+MODEL_PATH = "/data/srq/Qwen/Qwen/Qwen2.5-VL-7B-Instruct" 
+OUTPUT_DIR = "./output/Qwen2.5-VL-Video-SFT"
+MAX_LENGTH = 4096 
+FREEZE_VISION = True  # 显存优化：冻结视觉塔
+USE_LORA = True
 
-# [创新点] 引入 VidGuard-R1 的 CoT 系统提示词
-# 引导模型在给出 Real/Generated 结论前，先进行 <think> 推理
-SYSTEM_PROMPT = """Analyze the input video to determine if it is real or AI-generated.
-Your reasoning should focus on four key diagnostic categories:
-1. Motion Consistency: Check for unnatural movements or floating objects.
-2. Lighting Consistency: Check for shadows and light sources that match the environment.
-3. Texture Artifacts: Look for overly smooth, plastic-like surfaces or jagged edges.
-4. Physics Violations: Ensure gravity and object interactions obey physical laws.
+# --- 2. 核心优化：自定义 Data Collator (增强鲁棒性) ---
+@dataclass
+class QwenVideoDataCollator:
+    tokenizer: transformers.PreTrainedTokenizer
 
-Format your response as:
-<think>
-[Detailed reasoning covering the 4 categories]
-</think>
-<answer> [Real or Generated] </answer>"""
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        # 1. 提取文本输入和标签
+        input_ids = [instance["input_ids"] for instance in instances]
+        labels = [instance["labels"] for instance in instances]
+        
+        # 2. Pad 文本部分 (batch_first=True)
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=-100 # Ignore index for loss
+        )
+        
+        # 3. 截断 (防止异常数据导致OOM)
+        input_ids = input_ids[:, :self.tokenizer.model_max_length]
+        labels = labels[:, :self.tokenizer.model_max_length]
+        
+        # 4. 构建 Attention Mask
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
 
-# 如果显存紧张，可以降低分辨率限制
-MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 1280 * 28 * 28 
-
-def process_func(example):
-    """
-    预处理函数：支持视频和图片混合输入
-    """
-    input_ids, attention_mask, labels = [], [], []
-    conversation = example["conversations"]
-    
-    # 约定：JSON中第一条由用户提供文件路径，第二条是助手回答
-    file_path = conversation[0]["value"]
-    output_content = conversation[1]["value"]
-    
-    # 根据后缀判断是视频还是图片
-    ext = os.path.splitext(file_path)[-1].lower()
-    if ext in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
-        content_item = {
-            "type": "video",
-            "video": file_path,
-            # "max_pixels": 360 * 420, # 可选：限制视频帧分辨率以节省显存
-            # "fps": 1.0, # 可选：设置采样帧率
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
         }
-        default_prompt = SYSTEM_PROMPT
-    else:
-        content_item = {
-            "type": "image",
-            "image": file_path,
-        }
-        default_prompt = "Describe this image."
 
-    # 构造 Qwen 格式的消息
+        # 5. [优化] 鲁棒的视觉特征收集
+        # 不再只检查 instances[0]，而是检查 batch 中是否存在任何视觉特征
+        
+        # 处理图片 (Pixel Values)
+        if any("pixel_values" in inst for inst in instances):
+            pixel_values = [inst["pixel_values"] for inst in instances if "pixel_values" in inst]
+            image_grid_thw = [inst["image_grid_thw"] for inst in instances if "image_grid_thw" in inst]
+            
+            if len(pixel_values) > 0:
+                batch["pixel_values"] = torch.cat(pixel_values, dim=0)
+                batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
+
+        # 处理视频 (Pixel Values Videos) - Qwen2.5-VL 核心
+        # 兼容 pixel_values_videos 和 video_pixel_values 两种命名
+        video_keys = ["pixel_values_videos", "video_pixel_values"]
+        target_key = next((k for k in video_keys if any(k in inst for inst in instances)), None)
+
+        if target_key:
+            pv_videos = [inst[target_key] for inst in instances if target_key in inst]
+            video_grid_thw = [inst["video_grid_thw"] for inst in instances if "video_grid_thw" in inst]
+            
+            if len(pv_videos) > 0:
+                # 官方模型 forward 默认使用 'pixel_values_videos'
+                batch["pixel_values_videos"] = torch.cat(pv_videos, dim=0)
+                batch["video_grid_thw"] = torch.cat(video_grid_thw, dim=0)
+
+        return batch
+
+# --- 3. 数据处理函数 ---
+def process_func(example, processor, tokenizer):
     messages = [
         {
             "role": "user",
             "content": [
-                content_item,
-                {"type": "text", "text": default_prompt},
-            ],
+                {"type": "video", "video": example["conversations"][0]["value"]},
+                {"type": "text", "text": "Analyze the video. Is it Real or Generated?"}
+            ]
         }
     ]
-
-    # 1. 应用聊天模板获取文本
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
     
-    # 2. 处理视觉信息 (加载图片/视频)
+    # 预处理视觉信息
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     
-    # 3. 输入 Processor
+    # 输入 Processor
     inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
+        text=[text], 
+        images=image_inputs, 
+        videos=video_inputs, 
+        padding=False, # [重要] padding 交给 Collator，节省处理时间
+        return_tensors="pt"
     )
     
-    # 转换为 dict 并移除 batch 维度
-    inputs = {key: value.tolist() for key, value in inputs.items()} 
-    instruction = inputs
-
-    # 4. 处理 Label (回答部分)
-    response = tokenizer(f"{output_content}", add_special_tokens=False)
-
-    # 5. 拼接 Input IDs 和 Labels
-    input_ids = (
-            instruction["input_ids"][0] + response["input_ids"] + [tokenizer.pad_token_id]
-    )
-    attention_mask = instruction["attention_mask"][0] + response["attention_mask"] + [1]
+    # 处理 Label (Answer)
+    response = example["conversations"][1]["value"]
+    resp_tokens = tokenizer.encode(response, add_special_tokens=False)
     
-    # Label 中 Instruction 部分设为 -100 (不计算 Loss)
-    labels = (
-            [-100] * len(instruction["input_ids"][0])
-            + response["input_ids"]
-            + [tokenizer.pad_token_id]
-    )
-
-    # 截断
-    if len(input_ids) > MAX_LENGTH:
-        input_ids = input_ids[:MAX_LENGTH]
-        attention_mask = attention_mask[:MAX_LENGTH]
-        labels = labels[:MAX_LENGTH]
-
-    # 构造返回字典，保留 Qwen2.5-VL 特有的视觉特征字段
+    # 构建 Input IDs 和 Labels
+    input_ids = inputs["input_ids"][0].tolist() + resp_tokens + [tokenizer.pad_token_id]
+    labels = [-100] * len(inputs["input_ids"][0]) + resp_tokens + [tokenizer.pad_token_id]
+    
     final_dict = {
-        "input_ids": torch.tensor(input_ids),
-        "attention_mask": torch.tensor(attention_mask),
-        "labels": torch.tensor(labels),
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
     }
     
-    # 动态添加存在的视觉字段
-    for key in ['pixel_values', 'image_grid_thw', 'video_pixel_values', 'video_grid_thw']:
-        if key in inputs:
-            # 部分字段可能需要 squeeze 去掉 batch 维度
-            tensor_val = torch.tensor(inputs[key])
-            if key in ['image_grid_thw', 'video_grid_thw']:
-                tensor_val = tensor_val.squeeze(0)
-            final_dict[key] = tensor_val
+    # 提取视觉特征并移除 batch 维度 (processor 输出通常带 batch=1)
+    if "pixel_values" in inputs:
+        final_dict["pixel_values"] = inputs["pixel_values"] 
+        final_dict["image_grid_thw"] = inputs["image_grid_thw"] # shape: (1, 3)
+        
+    if "pixel_values_videos" in inputs:
+        final_dict["pixel_values_videos"] = inputs["pixel_values_videos"]
+        final_dict["video_grid_thw"] = inputs["video_grid_thw"] # shape: (1, 3)
+    elif "video_pixel_values" in inputs:
+        final_dict["pixel_values_videos"] = inputs["video_pixel_values"]
+        final_dict["video_grid_thw"] = inputs["video_grid_thw"]
             
     return final_dict
 
-# --- 主流程 ---
+# --- 4. 主程序 ---
+def train():
+    # 初始化 Processor
+    processor = AutoProcessor.from_pretrained(
+        MODEL_PATH, 
+        min_pixels=256*28*28, 
+        max_pixels=1280*28*28,
+        padding_side="right"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    config = AutoConfig.from_pretrained(MODEL_PATH)
+    config._attn_implementation = "sdpa"
+    # 加载模型
+    print("Loading model...")
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_PATH, 
+        torch_dtype=torch.bfloat16, 
+        config=config,
+        device_map=None 
+    )
 
-# 1. 加载 Processor
-processor = AutoProcessor.from_pretrained(
-    local_model_path, 
-    min_pixels=MIN_PIXELS, 
-    max_pixels=MAX_PIXELS
-)
+    # [优化] 冻结视觉塔 (参考官方逻辑)
+    if FREEZE_VISION:
+        print("❄️ Freezing Vision Tower (saving ~30% memory)...")
+        # Qwen2.5-VL 的视觉部分通常在 model.visual
+        for param in model.visual.parameters():
+            param.requires_grad = False
+        # 确保 LLM 部分参与训练
 
-# 2. 加载 Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(
-    local_model_path, 
-    use_fast=False, 
-    trust_remote_code=True
-)
+    # LoRA 配置
+    if USE_LORA:
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            r=64, 
+            lora_alpha=16, 
+            lora_dropout=0.05, 
+            bias="none",
+            modules_to_save=[] # 不保存 embedding/head，只保存 adapter，减小权重体积
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
-# 3. 加载模型
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    local_model_path, 
-    device_map="auto", 
-    torch_dtype=torch.bfloat16, 
-    trust_remote_code=True,
-)
-model.enable_input_require_grads()
+    # 准备数据
+    if not os.path.exists("train.json"): 
+        raise FileNotFoundError("Run gen_cot_data.py first!")
+    
+    train_ds = Dataset.from_json("train.json")
+    print(f"Loaded {len(train_ds)} samples from train.json")
+    # 包装 process_func
+    def _process(x): return process_func(x, processor, tokenizer)
+    
+    # 预处理数据 (Map)
+    print("Processing dataset...")
+    train_dataset = train_ds.map(_process, remove_columns=train_ds.column_names)
+    
+    eval_dataset = None
+    if os.path.exists("test.json"):
+        eval_ds = Dataset.from_json("test.json").select(range(50)) # 少量验证
+        eval_dataset = eval_ds.map(_process, remove_columns=eval_ds.column_names)
 
-# 4. 加载并处理数据
-# 确保你的 train.json 格式正确
-if not os.path.exists(train_dataset_json_path):
-    raise FileNotFoundError(f"找不到数据集文件: {train_dataset_json_path}")
+    # SwanLab 配置
+    swanlab_callback = SwanLabCallback(
+        project="Qwen2.5-VL-Video-Detection",
+        experiment_name="Custom-Train-SFT",
+        config={"freeze_vision": FREEZE_VISION, "max_length": MAX_LENGTH}
+    )
 
-train_ds = Dataset.from_json(train_dataset_json_path)
-train_dataset = train_ds.map(process_func)
+    # 训练参数
+    args = TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        per_device_train_batch_size=1, # 视频显存大，建议保持1
+        gradient_accumulation_steps=8, # 累计梯度，等效 batch=8
+        num_train_epochs=3,
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        warmup_ratio=0.03,
+        bf16=True, # 必须开启 bf16
+        gradient_checkpointing=True, # 必须开启显存优化
+        dataloader_pin_memory=True,
+        remove_unused_columns=False, # [重要] 防止 Collator 需要的自定义 key 被删除
+        evaluation_strategy="steps" if eval_dataset else "no",
+        eval_steps=50,
+        save_steps=50,
+        save_total_limit=2,
+        logging_steps=5,
+        report_to="none", # 关闭默认wandb，只用SwanLab
+    )
 
-# 5. 配置 LoRA
-config = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    inference_mode=False,
-    r=64,
-    lora_alpha=16,
-    lora_dropout=0.05,
-    bias="none",
-)
-train_peft_model = get_peft_model(model, config)
-train_peft_model.print_trainable_parameters()
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=QwenVideoDataCollator(tokenizer),
+        callbacks=[swanlab_callback],
+    )
 
-# 6. 训练参数配置
-args = TrainingArguments(
-    output_dir=output_dir,
-    per_device_train_batch_size=1,     # 视频显存占用大，建议为1
-    gradient_accumulation_steps=4,     # 累积4步相当于batch_size=4
-    logging_steps=5,
-    num_train_epochs=3,
-    save_steps=100,
-    learning_rate=1e-4,
-    save_on_each_node=True,
-    gradient_checkpointing=True,       # 显存优化：必须开启
-    report_to="none",                  # 默认不上传 wandb 等
-    bf16=True,                         # Qwen2.5 推荐 bf16
-    dataloader_pin_memory=False,       # 避免多模态数据加载卡死
-    remove_unused_columns=False,       # 必须设为False，否则自定义字段会被过滤
-)
+    print("🚀 Starting training...")
+    trainer.train()
+    
+    # 结束与保存
+    swanlab.finish()
+    trainer.save_model(f"{OUTPUT_DIR}/final")
+    processor.save_pretrained(f"{OUTPUT_DIR}/final") # 同时保存 processor 配置
+    print(f"Training finished. Model saved to {OUTPUT_DIR}/final")
 
-# 7. SwanLab 回调 (如果你需要可视化训练曲线)
-swanlab_callback = SwanLabCallback(
-    project="Qwen2.5-VL-Video-Detection",
-    experiment_name="run-v1",
-    config={
-        "model_path": local_model_path,
-        "lora_rank": 64,
-    },
-)
+if __name__ == "__main__":
+    train()
 
-# 8. 开始训练
-trainer = Trainer(
-    model=train_peft_model,
-    args=args,
-    train_dataset=train_dataset,
-    data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
-    callbacks=[swanlab_callback],
-)
-
-print("开始训练...")
-trainer.train()
+# torchrun --nproc_per_node=auto --master_port=29500 train.py --deepspeed qwen-vl-finetune/scripts/zero3.json
