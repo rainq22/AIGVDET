@@ -11,9 +11,11 @@ import sys
 import warnings
 import time
 from datetime import datetime
+from tqdm import tqdm
+import pickle
 
 # ========== 环境配置（必须放最前面） ==========
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
 os.environ["FORCE_QWENVL_VIDEO_READER"] = "torchvision"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -21,6 +23,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", message=".*video decoding.*deprecated.*")
 warnings.filterwarnings("ignore", message=".*torchvision.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*fast processor.*")
 
 import torch
 import json
@@ -57,11 +60,11 @@ class TrainConfig:
     # 数据路径
     train_json: str = "train.json"
     test_json: str = "test.json"
-    train_cache: str = "./cache/train_processed"
-    eval_cache: str = "./cache/eval_processed"
+    train_cache: str = "./cache/train_pt"      # 改为 pt 格式
+    eval_cache: str = "./cache/eval_pt"
     
     # 模型配置
-    max_length: int = 4096
+    max_length: int = 8192              # ← 增大，避免截断视频 token
     freeze_vision: bool = True
     use_lora: bool = True
     
@@ -70,20 +73,24 @@ class TrainConfig:
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     
-    # 训练超参数 (4x L40S 48GB 优化)
-    per_device_batch_size: int = 2      # 每卡 batch size
-    gradient_accumulation: int = 4       # 梯度累积
+    # ═══════════════════════════════════════════════════════════════
+    # 训练超参数 - 优化配置
+    # ═══════════════════════════════════════════════════════════════
+    per_device_batch_size: int = 1      # ← 改为 1，视频必须单样本
+    gradient_accumulation: int = 8       # ← 增加到 8，有效 batch = 1×4×8=32
     num_epochs: int = 20
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-4          # ← 稍微提高
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.03
+    warmup_steps: int = 100              # ← 用 warmup_steps 替代 warmup_ratio
     
-    # 资源控制
-    num_workers: int = 4                 # DataLoader workers
-    cpu_threads: int = 16                # 每进程 CPU 线程数
+    # ═══════════════════════════════════════════════════════════════
+    # 资源控制 - 关键优化
+    # ═══════════════════════════════════════════════════════════════
+    num_workers: int = 8                 # ← 改为 0！避免多进程开销
+    cpu_threads: int = 8                 # ← 降低
     
     # 评估与保存
-    eval_samples: int = 50               # 验证集样本数
+    eval_samples: int = 50
     eval_steps: int = 100
     save_steps: int = 200
     save_total_limit: int = 3
@@ -160,7 +167,7 @@ def print_config():
     print(f"  Batch Size:    {CONFIG.per_device_batch_size} x 4卡 x {CONFIG.gradient_accumulation}累积 = {CONFIG.per_device_batch_size * 4 * CONFIG.gradient_accumulation}")
     print(f"  学习率:        {CONFIG.learning_rate}")
     print(f"  训练轮数:      {CONFIG.num_epochs}")
-    print(f"  Warmup:        {CONFIG.warmup_ratio * 100:.0f}%")
+    print(f"  Warmup:        {CONFIG.warmup_steps}")
     print("-" * 60)
     print(f"  DataLoader:    {CONFIG.num_workers} workers")
     print(f"  CPU 线程:      {CONFIG.cpu_threads}")
@@ -239,12 +246,11 @@ class TrainingMonitorCallback(TrainerCallback):
 
 @dataclass
 class QwenVideoDataCollator:
-    """视频数据整理器"""
     tokenizer: transformers.PreTrainedTokenizer
-    max_length: int = 4096
+    max_length: int = 8192              # ← 增大
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        # 提取并填充 input_ids 和 labels
+        # 不截断 input_ids，避免 token/feature 不匹配
         input_ids = [inst["input_ids"] for inst in instances]
         labels = [inst["labels"] for inst in instances]
         
@@ -255,9 +261,9 @@ class QwenVideoDataCollator:
             labels, batch_first=True, padding_value=-100
         )
         
-        # 截断到最大长度
-        input_ids = input_ids[:, :self.max_length]
-        labels = labels[:, :self.max_length]
+        # 移除截断，或者设置一个很大的值
+        # input_ids = input_ids[:, :self.max_length]  # 注释掉或删除
+        # labels = labels[:, :self.max_length]        # 注释掉或删除
         
         batch = {
             "input_ids": input_ids,
@@ -343,63 +349,107 @@ def process_func(example, processor, tokenizer):
     return result
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║                     数据预处理                                    ║
+# ║                  自定义 Dataset（从 .pt 加载）                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class VideoDataset(torch.utils.data.Dataset):
+    """从预处理的 .pt 文件加载数据"""
+    
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+        self.index_file = os.path.join(cache_dir, "index.json")
+        
+        with open(self.index_file, "r") as f:
+            self.index = json.load(f)
+        
+        self.length = len(self.index)
+        print(f"  加载数据集: {self.length} 样本")
+    
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        pt_file = os.path.join(self.cache_dir, self.index[idx])
+        return torch.load(pt_file, weights_only=False)
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                     数据预处理（保存为 .pt）                       ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def preprocess_data():
-    """单独预处理数据（只需运行一次）"""
+    """单独预处理数据，保存为单独的 .pt 文件"""
     print_banner("📦 数据预处理")
     
     processor = AutoProcessor.from_pretrained(
         CONFIG.model_path, 
-        min_pixels=256*28*28, 
-        max_pixels=1280*28*28,
+        # ═══════════════════════════════════════════════════════════════
+        # 关键修改：大幅降低视频分辨率
+        # ═══════════════════════════════════════════════════════════════
+        min_pixels=128*28*28,       # ← 降低：128×28×28 = 100,352
+        max_pixels=256*28*28,       # ← 大幅降低：256×28×28 = 200,704（原来 1280×28×28）
         padding_side="right"
     )
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_path)
     
-    def _process(x): 
-        return process_func(x, processor, tokenizer)
-    
-    # 处理训练集
-    if not os.path.exists(CONFIG.train_cache):
-        print(f"📂 加载训练数据: {CONFIG.train_json}")
-        train_ds = Dataset.from_json(CONFIG.train_json)
-        print(f"   样本数: {len(train_ds)}")
+    def process_and_save(json_file, cache_dir, desc, max_samples=None):
+        """处理数据并保存为 .pt 文件"""
+        if os.path.exists(os.path.join(cache_dir, "index.json")):
+            print(f"✅ 缓存已存在: {cache_dir}")
+            return
         
-        print("🔄 处理中... (这可能需要几小时)")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        with open(json_file, "r") as f:
+            data = json.load(f)
+        
+        if max_samples:
+            data = data[:max_samples]
+        
+        print(f"📂 加载数据: {json_file}")
+        print(f"   样本数: {len(data)}")
+        print("🔄 处理中...")
+        
+        index = []
+        failed = []
         start_time = time.time()
         
-        train_dataset = train_ds.map(
-            _process, 
-            remove_columns=train_ds.column_names,
-            num_proc=1,
-            desc="处理训练集"
-        )
+        for i, sample in enumerate(tqdm(data, desc=desc)):
+            try:
+                result = process_func(sample, processor, tokenizer)
+                
+                # 保存为单独的 .pt 文件
+                pt_filename = f"sample_{i:06d}.pt"
+                pt_path = os.path.join(cache_dir, pt_filename)
+                torch.save(result, pt_path)
+                index.append(pt_filename)
+                
+            except Exception as e:
+                failed.append((i, str(e)))
+                print(f"\n⚠️ 样本 {i} 处理失败: {e}")
+                continue
         
-        os.makedirs(os.path.dirname(CONFIG.train_cache), exist_ok=True)
-        train_dataset.save_to_disk(CONFIG.train_cache)
+        # 保存索引文件
+        with open(os.path.join(cache_dir, "index.json"), "w") as f:
+            json.dump(index, f)
         
         elapsed = time.time() - start_time
-        print(f"✅ 训练集处理完成! 耗时: {format_time(elapsed)}")
-        print(f"   保存到: {CONFIG.train_cache}")
-    else:
-        print(f"✅ 训练集缓存已存在: {CONFIG.train_cache}")
+        print(f"\n✅ 处理完成!")
+        print(f"   成功: {len(index)}, 失败: {len(failed)}")
+        print(f"   耗时: {format_time(elapsed)}")
+        print(f"   保存到: {cache_dir}")
+        
+        if failed:
+            with open(os.path.join(cache_dir, "failed.json"), "w") as f:
+                json.dump(failed, f, indent=2)
+            print(f"   失败记录: {os.path.join(cache_dir, 'failed.json')}")
+    
+    # 处理训练集
+    process_and_save(CONFIG.train_json, CONFIG.train_cache, "处理训练集")
     
     # 处理验证集
-    if os.path.exists(CONFIG.test_json) and not os.path.exists(CONFIG.eval_cache):
-        print(f"\n📂 加载验证数据: {CONFIG.test_json}")
-        eval_ds = Dataset.from_json(CONFIG.test_json).select(range(CONFIG.eval_samples))
-        print(f"   样本数: {len(eval_ds)}")
-        
-        eval_dataset = eval_ds.map(
-            _process, 
-            remove_columns=eval_ds.column_names,
-            num_proc=1,
-            desc="处理验证集"
-        )
-        eval_dataset.save_to_disk(CONFIG.eval_cache)
-        print(f"✅ 验证集保存到: {CONFIG.eval_cache}")
+    if os.path.exists(CONFIG.test_json):
+        process_and_save(CONFIG.test_json, CONFIG.eval_cache, "处理验证集", 
+                        max_samples=CONFIG.eval_samples)
     
     print("\n" + "=" * 50)
     print("🎉 预处理完成! 现在可以运行训练:")
@@ -420,8 +470,8 @@ def train():
     print_main("📥 加载 Processor 和 Tokenizer...")
     processor = AutoProcessor.from_pretrained(
         CONFIG.model_path, 
-        min_pixels=256*28*28, 
-        max_pixels=1280*28*28,
+        min_pixels=128*28*28,       # ← 保持一致
+        max_pixels=256*28*28,       # ← 保持一致
         padding_side="right"
     )
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_path)
@@ -462,21 +512,22 @@ def train():
         if is_main_process():
             model.print_trainable_parameters()
 
-    # 加载数据
-    if not os.path.exists(CONFIG.train_cache):
+    # 检查缓存
+    train_index = os.path.join(CONFIG.train_cache, "index.json")
+    if not os.path.exists(train_index):
         raise FileNotFoundError(
             f"\n❌ 未找到预处理数据!\n"
             f"   请先运行: python train.py --preprocess\n"
         )
     
-    print_main(f"📂 加载预处理数据: {CONFIG.train_cache}")
-    train_dataset = load_from_disk(CONFIG.train_cache)
-    print_main(f"   训练集: {len(train_dataset)} 样本")
+    # 加载数据集
+    print_main(f"📂 加载预处理数据...")
+    train_dataset = VideoDataset(CONFIG.train_cache)
     
     eval_dataset = None
-    if os.path.exists(CONFIG.eval_cache):
-        eval_dataset = load_from_disk(CONFIG.eval_cache)
-        print_main(f"   验证集: {len(eval_dataset)} 样本")
+    eval_index = os.path.join(CONFIG.eval_cache, "index.json")
+    if os.path.exists(eval_index):
+        eval_dataset = VideoDataset(CONFIG.eval_cache)
 
     # 回调函数
     callbacks = [
@@ -494,37 +545,24 @@ def train():
         ),
     ]
 
-    # 训练参数
     training_args = TrainingArguments(
         output_dir=CONFIG.output_dir,
-        
-        # 批次设置
         per_device_train_batch_size=CONFIG.per_device_batch_size,
         per_device_eval_batch_size=CONFIG.per_device_batch_size,
         gradient_accumulation_steps=CONFIG.gradient_accumulation,
-        
-        # 训练设置
         num_train_epochs=CONFIG.num_epochs,
         learning_rate=CONFIG.learning_rate,
         weight_decay=CONFIG.weight_decay,
-        warmup_ratio=CONFIG.warmup_ratio,
+        warmup_steps=CONFIG.warmup_steps,    # ← 用 warmup_steps
         lr_scheduler_type="cosine",
-        
-        # 精度与显存优化
         bf16=True,
-        tf32=True,                              # L40S 支持 TF32
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        
-        # DataLoader
-        dataloader_pin_memory=True,
-        dataloader_num_workers=CONFIG.num_workers,
-        dataloader_prefetch_factor=2,
-        
-        # 日志与保存
+        dataloader_pin_memory=True,          # ← 改为 False
+        dataloader_num_workers=CONFIG.num_workers,             # ← 改为 0
         logging_steps=CONFIG.logging_steps,
         logging_first_step=True,
-        evaluation_strategy="steps" if eval_dataset else "no",
+        eval_strategy="steps" if eval_dataset else "no",
         eval_steps=CONFIG.eval_steps,
         save_strategy="steps",
         save_steps=CONFIG.save_steps,
@@ -532,18 +570,13 @@ def train():
         load_best_model_at_end=True if eval_dataset else False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        
-        # 分布式训练
         ddp_find_unused_parameters=False,
         ddp_backend="nccl",
-        
-        # 其他
         remove_unused_columns=False,
         report_to="none",
         seed=42,
     )
 
-    # 初始化 Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -553,7 +586,6 @@ def train():
         callbacks=callbacks,
     )
 
-    # 开始训练
     trainer.train()
     
     # 保存最终模型
