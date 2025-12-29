@@ -1,25 +1,30 @@
-# # 查看帮助
-# python train.py --help
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  train_v2.py - 增强版训练脚本                                     ║
+# ║  创新点:                                                          ║
+# ║    A) Label Mask 策略: full / answer_only / rationale_dropout    ║
+# ║    B) 多任务学习: 同时预测 Real/Generated + 生成器来源             ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
-# # 第一步：预处理数据
-# python train.py --preprocess
+# 使用方法:
+#   python train_v2.py --preprocess                    # 预处理数据
+#   torchrun --nproc_per_node=4 train_v2.py            # 训练 (默认 full loss)
+#   torchrun --nproc_per_node=4 train_v2.py --loss_mode answer_only
+#   torchrun --nproc_per_node=4 train_v2.py --loss_mode rationale_dropout --dropout_prob 0.5
 
-# # 第二步：4卡训练
-# torchrun --nproc_per_node=4 train.py
 import os
 import sys
 import warnings
 import time
+import re
+import random
 from datetime import datetime
 from tqdm import tqdm
-import pickle
 
-# ========== 环境配置（必须放最前面） ==========
+# ========== 环境配置 ==========
 os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
 os.environ["FORCE_QWENVL_VIDEO_READER"] = "torchvision"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# 抑制警告
 warnings.filterwarnings("ignore", message=".*video decoding.*deprecated.*")
 warnings.filterwarnings("ignore", message=".*torchvision.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -27,19 +32,18 @@ warnings.filterwarnings("ignore", message=".*fast processor.*")
 
 import torch
 import json
-import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Sequence
-from datasets import Dataset, load_from_disk
 import transformers
 from transformers import (
     TrainingArguments,
     Trainer,
-    Qwen2_5_VLForConditionalGeneration, 
+    Qwen2_5_VLForConditionalGeneration,
     AutoProcessor,
     AutoTokenizer,
     AutoConfig,
     TrainerCallback,
+    HfArgumentParser,
 )
 from peft import LoraConfig, TaskType, get_peft_model
 from qwen_vl_utils import process_vision_info
@@ -52,51 +56,76 @@ from swanlab.integration.transformers import SwanLabCallback
 
 @dataclass
 class TrainConfig:
-    """训练配置 - 集中管理所有参数"""
+    """训练配置"""
     # 模型路径
     model_path: str = "/data/srq/Qwen/Qwen/Qwen2.5-VL-7B-Instruct"
-    output_dir: str = "./output/Qwen2.5-VL-Video-SFT"
+    output_dir: str = "./output/Qwen2.5-VL-Video-SFT-v2"
     
-    # 数据路径
-    train_json: str = "train.json"
-    test_json: str = "test.json"
-    train_cache: str = "./cache/train_pt"      # 改为 pt 格式
-    eval_cache: str = "./cache/eval_pt"
+    # 数据路径 (使用 v2 版本数据)
+    train_json: str = "train_v2.json"
+    test_json: str = "test_v2.json"
+    train_cache: str = "./cache/train_v2_pt"
+    eval_cache: str = "./cache/eval_v2_pt"
     
     # 模型配置
-    max_length: int = 8192              # ← 增大，避免截断视频 token
+    max_length: int = 8192
     freeze_vision: bool = True
     use_lora: bool = True
     
-    # LoRA 配置 - 减小防止过拟合
-    lora_r: int = 16              # ← 从 64 改
-    lora_alpha: int = 32          # ← 2×r
-    lora_dropout: float = 0.1     # ← 从 0.05 改
+    # LoRA 配置 (减小防止过拟合)
+    lora_r: int = 32                    # ← 从 64 减到 32
+    lora_alpha: int = 64                # ← 2x r
+    lora_dropout: float = 0.1           # ← 从 0.05 提高到 0.1
     
     # ═══════════════════════════════════════════════════════════════
-    # 训练超参数 - 优化配置
+    # 创新点 A: Loss Mask 策略
     # ═══════════════════════════════════════════════════════════════
-    per_device_batch_size: int = 1      # ← 改为 1，视频必须单样本
-    gradient_accumulation: int = 8       # ← 增加到 8，有效 batch = 1×4×8=32
-    num_epochs: int = 3           # ← 从 20 改
-    learning_rate: float = 5e-5   # ← 从 2e-4 改
+    loss_mode: str = "full"             # full / answer_only / rationale_dropout
+    dropout_prob: float = 0.5           # rationale_dropout 模式下的丢弃概率
+    
+    # 训练超参数
+    per_device_batch_size: int = 1
+    gradient_accumulation: int = 8
+    num_epochs: int = 5                 # ← 从 20 减到 5
+    learning_rate: float = 1e-4         # ← 从 2e-4 减到 1e-4
     weight_decay: float = 0.01
-    warmup_steps: int = 50        # ← 从 100 改（因为 epoch 少了）
+    warmup_steps: int = 50
     
-    # ═══════════════════════════════════════════════════════════════
-    # 资源控制 - 关键优化
-    # ═══════════════════════════════════════════════════════════════
-    num_workers: int = 8                 # ← 改为 0！避免多进程开销
-    cpu_threads: int = 8                 # ← 降低
+    # 资源控制
+    num_workers: int = 4
+    cpu_threads: int = 8
     
     # 评估与保存
-    eval_samples: int = 50
+    eval_samples: int = 100
     eval_steps: int = 100
     save_steps: int = 200
     save_total_limit: int = 3
     logging_steps: int = 10
 
-CONFIG = TrainConfig()
+# 解析命令行参数
+def parse_args():
+    config = TrainConfig()
+    
+    # 简单的命令行解析
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--loss_mode" and i + 1 < len(args):
+            config.loss_mode = args[i + 1]
+            i += 2
+        elif args[i] == "--dropout_prob" and i + 1 < len(args):
+            config.dropout_prob = float(args[i + 1])
+            i += 2
+        elif args[i] == "--preprocess":
+            i += 1
+        elif args[i] in ["--help", "-h"]:
+            i += 1
+        else:
+            i += 1
+    
+    return config
+
+CONFIG = parse_args()
 
 # 设置 CPU 线程
 os.environ["OMP_NUM_THREADS"] = str(CONFIG.cpu_threads)
@@ -108,30 +137,24 @@ torch.set_num_threads(CONFIG.cpu_threads)
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def get_rank():
-    """获取当前进程 rank"""
     return int(os.environ.get("LOCAL_RANK", 0))
 
 def is_main_process():
-    """是否为主进程"""
     return get_rank() == 0
 
 def print_main(*args, **kwargs):
-    """只在主进程打印"""
     if is_main_process():
         print(*args, **kwargs)
 
 def format_time(seconds):
-    """格式化时间"""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def get_gpu_memory_info():
-    """获取 GPU 显存信息"""
     if not torch.cuda.is_available():
         return "N/A"
-    
     info = []
     for i in range(torch.cuda.device_count()):
         used = torch.cuda.memory_allocated(i) / 1024**3
@@ -140,7 +163,6 @@ def get_gpu_memory_info():
     return " | ".join(info)
 
 def print_banner(text, char="═", width=60):
-    """打印美观的横幅"""
     if not is_main_process():
         return
     border = char * width
@@ -150,36 +172,30 @@ def print_banner(text, char="═", width=60):
     print(f"╚{border}╝\n")
 
 def print_config():
-    """打印配置信息"""
     if not is_main_process():
         return
-    
     print("\n" + "=" * 60)
-    print("📋 训练配置")
+    print("📋 训练配置 (v2 - 创新版)")
     print("=" * 60)
     print(f"  模型路径:      {CONFIG.model_path}")
     print(f"  输出目录:      {CONFIG.output_dir}")
     print(f"  冻结视觉塔:    {'✅ 是' if CONFIG.freeze_vision else '❌ 否'}")
-    print(f"  使用 LoRA:     {'✅ 是' if CONFIG.use_lora else '❌ 否'}")
-    if CONFIG.use_lora:
-        print(f"    - r={CONFIG.lora_r}, alpha={CONFIG.lora_alpha}")
+    print(f"  使用 LoRA:     r={CONFIG.lora_r}, alpha={CONFIG.lora_alpha}")
     print("-" * 60)
-    print(f"  Batch Size:    {CONFIG.per_device_batch_size} x 4卡 x {CONFIG.gradient_accumulation}累积 = {CONFIG.per_device_batch_size * 4 * CONFIG.gradient_accumulation}")
+    print(f"  🔬 Loss 模式:   {CONFIG.loss_mode}")
+    if CONFIG.loss_mode == "rationale_dropout":
+        print(f"     Dropout率:  {CONFIG.dropout_prob}")
+    print("-" * 60)
+    print(f"  Batch Size:    {CONFIG.per_device_batch_size} x 4卡 x {CONFIG.gradient_accumulation}累积")
     print(f"  学习率:        {CONFIG.learning_rate}")
     print(f"  训练轮数:      {CONFIG.num_epochs}")
-    print(f"  Warmup:        {CONFIG.warmup_steps}")
-    print("-" * 60)
-    print(f"  DataLoader:    {CONFIG.num_workers} workers")
-    print(f"  CPU 线程:      {CONFIG.cpu_threads}")
     print("=" * 60 + "\n")
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║                    自定义回调 - 训练监控                           ║
+# ║                    自定义回调                                     ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 class TrainingMonitorCallback(TrainerCallback):
-    """训练过程监控回调"""
-    
     def __init__(self):
         self.start_time = None
         self.epoch_start_time = None
@@ -187,10 +203,9 @@ class TrainingMonitorCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         self.start_time = time.time()
         if is_main_process():
-            print_banner("🚀 开始训练")
+            print_banner("🚀 开始训练 (v2)")
             print(f"  📊 总步数: {state.max_steps}")
-            print(f"  📈 总样本: {state.max_steps * args.per_device_train_batch_size * args.gradient_accumulation_steps * 4}")
-            print(f"  🖥️  显存: {get_gpu_memory_info()}")
+            print(f"  🔬 Loss 模式: {CONFIG.loss_mode}")
             print()
     
     def on_epoch_begin(self, args, state, control, **kwargs):
@@ -201,44 +216,26 @@ class TrainingMonitorCallback(TrainerCallback):
             print(f"📅 Epoch {epoch}/{args.num_train_epochs}")
             print(f"{'─' * 50}")
     
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if is_main_process() and self.epoch_start_time:
-            epoch_time = time.time() - self.epoch_start_time
-            print(f"  ⏱️  Epoch 耗时: {format_time(epoch_time)}")
-    
     def on_log(self, args, state, control, logs=None, **kwargs):
         if is_main_process() and logs:
             step = state.global_step
-            
-            # 构建日志行
             log_parts = [f"Step {step:5d}"]
-            
             if "loss" in logs:
                 log_parts.append(f"Loss: {logs['loss']:.4f}")
             if "learning_rate" in logs:
                 log_parts.append(f"LR: {logs['learning_rate']:.2e}")
             if "eval_loss" in logs:
-                log_parts.append(f"Eval Loss: {logs['eval_loss']:.4f}")
-            
-            # 添加显存信息（每100步）
+                log_parts.append(f"Eval: {logs['eval_loss']:.4f}")
             if step % 100 == 0:
-                mem_used = torch.cuda.max_memory_allocated() / 1024**3
-                log_parts.append(f"Mem: {mem_used:.1f}GB")
-            
+                mem = torch.cuda.max_memory_allocated() / 1024**3
+                log_parts.append(f"Mem: {mem:.1f}GB")
             print(f"  {'  |  '.join(log_parts)}")
-    
-    def on_save(self, args, state, control, **kwargs):
-        if is_main_process():
-            print(f"  💾 模型已保存 (Step {state.global_step})")
     
     def on_train_end(self, args, state, control, **kwargs):
         if is_main_process() and self.start_time:
             total_time = time.time() - self.start_time
             print_banner("✅ 训练完成")
             print(f"  ⏱️  总耗时: {format_time(total_time)}")
-            print(f"  📊 最终 Loss: {state.log_history[-1].get('loss', 'N/A')}")
-            print(f"  🖥️  峰值显存: {torch.cuda.max_memory_allocated() / 1024**3:.1f} GB")
-            print()
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                     Data Collator                                ║
@@ -247,10 +244,9 @@ class TrainingMonitorCallback(TrainerCallback):
 @dataclass
 class QwenVideoDataCollator:
     tokenizer: transformers.PreTrainedTokenizer
-    max_length: int = 8192              # ← 增大
+    max_length: int = 8192
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        # 不截断 input_ids，避免 token/feature 不匹配
         input_ids = [inst["input_ids"] for inst in instances]
         labels = [inst["labels"] for inst in instances]
         
@@ -261,17 +257,12 @@ class QwenVideoDataCollator:
             labels, batch_first=True, padding_value=-100
         )
         
-        # 移除截断，或者设置一个很大的值
-        # input_ids = input_ids[:, :self.max_length]  # 注释掉或删除
-        # labels = labels[:, :self.max_length]        # 注释掉或删除
-        
         batch = {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
         }
 
-        # 处理图像数据
         if any("pixel_values" in inst for inst in instances):
             pixel_values = [inst["pixel_values"] for inst in instances if "pixel_values" in inst]
             image_grid_thw = [inst["image_grid_thw"] for inst in instances if "image_grid_thw" in inst]
@@ -279,11 +270,9 @@ class QwenVideoDataCollator:
                 batch["pixel_values"] = torch.cat(pixel_values, dim=0)
                 batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
 
-        # 处理视频数据
         video_key = next(
             (k for k in ["pixel_values_videos", "video_pixel_values"] 
-             if any(k in inst for inst in instances)), 
-            None
+             if any(k in inst for inst in instances)), None
         )
         if video_key:
             pv_videos = [inst[video_key] for inst in instances if video_key in inst]
@@ -295,17 +284,82 @@ class QwenVideoDataCollator:
         return batch
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║           创新点 A: Label Mask 策略实现                           ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def apply_label_mask(response_text: str, response_token_ids: List[int], 
+                     tokenizer, loss_mode: str, dropout_prob: float = 0.5) -> List[int]:
+    """
+    根据 loss_mode 对 response 的 labels 进行 mask
+    
+    Args:
+        response_text: 原始响应文本 (包含 <think>...</think><answer>...</answer><source>...</source>)
+        response_token_ids: response 的 token ids
+        tokenizer: tokenizer
+        loss_mode: "full" / "answer_only" / "rationale_dropout"
+        dropout_prob: rationale_dropout 模式下的丢弃概率
+    
+    Returns:
+        masked_labels: mask 后的 labels (-100 表示不计算 loss)
+    """
+    if loss_mode == "full":
+        # 全部计算 loss
+        return response_token_ids.copy()
+    
+    # 找到各部分的位置
+    think_start = response_text.find("<think>")
+    think_end = response_text.find("</think>")
+    answer_start = response_text.find("<answer>")
+    answer_end = response_text.find("</answer>")
+    source_start = response_text.find("<source>")
+    source_end = response_text.find("</source>")
+    
+    # 如果格式不对，退回到 full 模式
+    if think_start == -1 or think_end == -1 or answer_start == -1:
+        return response_token_ids.copy()
+    
+    # 用字符位置估算 token 位置（近似方法）
+    # 更精确的方法需要逐段 tokenize，但这里用比例估算
+    total_chars = len(response_text)
+    total_tokens = len(response_token_ids)
+    
+    def char_to_token_pos(char_pos):
+        return int((char_pos / total_chars) * total_tokens)
+    
+    think_start_tok = char_to_token_pos(think_start)
+    think_end_tok = char_to_token_pos(think_end + len("</think>"))
+    answer_start_tok = char_to_token_pos(answer_start)
+    answer_end_tok = char_to_token_pos(answer_end + len("</answer>"))
+    source_start_tok = char_to_token_pos(source_start) if source_start != -1 else total_tokens
+    source_end_tok = char_to_token_pos(source_end + len("</source>")) if source_end != -1 else total_tokens
+    
+    masked_labels = response_token_ids.copy()
+    
+    if loss_mode == "answer_only":
+        # 只对 <answer> 和 <source> 部分计算 loss，mask 掉 <think>
+        for i in range(think_start_tok, min(think_end_tok, len(masked_labels))):
+            masked_labels[i] = -100
+            
+    elif loss_mode == "rationale_dropout":
+        # 随机决定是否 mask <think> 部分
+        if random.random() < dropout_prob:
+            for i in range(think_start_tok, min(think_end_tok, len(masked_labels))):
+                masked_labels[i] = -100
+    
+    return masked_labels
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║                     数据处理函数                                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-def process_func(example, processor, tokenizer):
-    """处理单个样本"""
+def process_func(example, processor, tokenizer, loss_mode="full", dropout_prob=0.5):
+    """处理单个样本，支持 Label Mask 策略"""
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "video", "video": example["conversations"][0]["value"]},
-                {"type": "text", "text": "Analyze the video. Is it Real or Generated?"}
+                {"type": "text", "text": "Analyze the video. Is it Real or Generated? Also identify the source."}
             ]
         }
     ]
@@ -325,16 +379,21 @@ def process_func(example, processor, tokenizer):
     response = example["conversations"][1]["value"]
     resp_tokens = tokenizer.encode(response, add_special_tokens=False)
     
+    # 应用 Label Mask 策略 (创新点 A)
+    masked_resp_labels = apply_label_mask(
+        response, resp_tokens, tokenizer, 
+        loss_mode=loss_mode, dropout_prob=dropout_prob
+    )
+    
     # 构建完整序列
     input_ids = inputs["input_ids"][0].tolist() + resp_tokens + [tokenizer.pad_token_id]
-    labels = [-100] * len(inputs["input_ids"][0]) + resp_tokens + [tokenizer.pad_token_id]
+    labels = [-100] * len(inputs["input_ids"][0]) + masked_resp_labels + [tokenizer.pad_token_id]
     
     result = {
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
     
-    # 添加视觉特征
     if "pixel_values" in inputs:
         result["pixel_values"] = inputs["pixel_values"] 
         result["image_grid_thw"] = inputs["image_grid_thw"]
@@ -349,12 +408,10 @@ def process_func(example, processor, tokenizer):
     return result
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║                  自定义 Dataset（从 .pt 加载）                    ║
+# ║                  自定义 Dataset                                   ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 class VideoDataset(torch.utils.data.Dataset):
-    """从预处理的 .pt 文件加载数据"""
-    
     def __init__(self, cache_dir: str):
         self.cache_dir = cache_dir
         self.index_file = os.path.join(cache_dir, "index.json")
@@ -373,26 +430,21 @@ class VideoDataset(torch.utils.data.Dataset):
         return torch.load(pt_file, weights_only=False)
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║                     数据预处理（保存为 .pt）                       ║
+# ║                     数据预处理                                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def preprocess_data():
-    """单独预处理数据，保存为单独的 .pt 文件"""
-    print_banner("📦 数据预处理")
+    print_banner("📦 数据预处理 (v2)")
     
     processor = AutoProcessor.from_pretrained(
         CONFIG.model_path, 
-        # ═══════════════════════════════════════════════════════════════
-        # 关键修改：大幅降低视频分辨率
-        # ═══════════════════════════════════════════════════════════════
-        min_pixels=128*28*28,       # ← 降低：128×28×28 = 100,352
-        max_pixels=256*28*28,       # ← 大幅降低：256×28×28 = 200,704（原来 1280×28×28）
+        min_pixels=128*28*28,
+        max_pixels=256*28*28,
         padding_side="right"
     )
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_path)
     
     def process_and_save(json_file, cache_dir, desc, max_samples=None):
-        """处理数据并保存为 .pt 文件"""
         if os.path.exists(os.path.join(cache_dir, "index.json")):
             print(f"✅ 缓存已存在: {cache_dir}")
             return
@@ -407,7 +459,7 @@ def preprocess_data():
         
         print(f"📂 加载数据: {json_file}")
         print(f"   样本数: {len(data)}")
-        print("🔄 处理中...")
+        print(f"   Loss 模式: {CONFIG.loss_mode}")
         
         index = []
         failed = []
@@ -415,9 +467,12 @@ def preprocess_data():
         
         for i, sample in enumerate(tqdm(data, desc=desc)):
             try:
-                result = process_func(sample, processor, tokenizer)
+                result = process_func(
+                    sample, processor, tokenizer,
+                    loss_mode=CONFIG.loss_mode,
+                    dropout_prob=CONFIG.dropout_prob
+                )
                 
-                # 保存为单独的 .pt 文件
                 pt_filename = f"sample_{i:06d}.pt"
                 pt_path = os.path.join(cache_dir, pt_filename)
                 torch.save(result, pt_path)
@@ -428,75 +483,54 @@ def preprocess_data():
                 print(f"\n⚠️ 样本 {i} 处理失败: {e}")
                 continue
         
-        # 保存索引文件
         with open(os.path.join(cache_dir, "index.json"), "w") as f:
             json.dump(index, f)
         
         elapsed = time.time() - start_time
-        print(f"\n✅ 处理完成!")
-        print(f"   成功: {len(index)}, 失败: {len(failed)}")
+        print(f"\n✅ 处理完成! 成功: {len(index)}, 失败: {len(failed)}")
         print(f"   耗时: {format_time(elapsed)}")
-        print(f"   保存到: {cache_dir}")
-        
-        if failed:
-            with open(os.path.join(cache_dir, "failed.json"), "w") as f:
-                json.dump(failed, f, indent=2)
-            print(f"   失败记录: {os.path.join(cache_dir, 'failed.json')}")
     
-    # 处理训练集
     process_and_save(CONFIG.train_json, CONFIG.train_cache, "处理训练集")
     
-    # 处理验证集
     if os.path.exists(CONFIG.test_json):
         process_and_save(CONFIG.test_json, CONFIG.eval_cache, "处理验证集", 
                         max_samples=CONFIG.eval_samples)
     
-    print("\n" + "=" * 50)
-    print("🎉 预处理完成! 现在可以运行训练:")
-    print("   torchrun --nproc_per_node=4 train.py")
-    print("=" * 50)
+    print("\n🎉 预处理完成! 运行训练:")
+    print(f"   torchrun --nproc_per_node=4 train_v2.py --loss_mode {CONFIG.loss_mode}")
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                     主训练函数                                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def train():
-    """主训练流程"""
-    
-    # 打印配置（只在主进程）
     print_config()
     
-    # 加载 tokenizer 和 processor
-    print_main("📥 加载 Processor 和 Tokenizer...")
+    print_main("📥 加载模型...")
     processor = AutoProcessor.from_pretrained(
         CONFIG.model_path, 
-        min_pixels=128*28*28,       # ← 保持一致
-        max_pixels=256*28*28,       # ← 保持一致
+        min_pixels=128*28*28,
+        max_pixels=256*28*28,
         padding_side="right"
     )
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_path)
     
-    # 加载模型
-    print_main("📥 加载模型...")
     config = AutoConfig.from_pretrained(CONFIG.model_path)
-    config._attn_implementation = "sdpa"  # 使用高效注意力
+    config._attn_implementation = "sdpa"
     
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         CONFIG.model_path, 
         torch_dtype=torch.bfloat16,
         config=config,
         device_map=None,
-        # 显存优化
         low_cpu_mem_usage=True,
     )
     
-    # 冻结视觉塔
     if CONFIG.freeze_vision:
-        print_main("❄️  冻结 Vision Tower (节省 ~30% 显存)")
+        print_main("❄️  冻结 Vision Tower")
         for param in model.visual.parameters():
             param.requires_grad = False
 
-    # 应用 LoRA
     if CONFIG.use_lora:
         print_main("🔧 应用 LoRA...")
         lora_config = LoraConfig(
@@ -512,15 +546,13 @@ def train():
         if is_main_process():
             model.print_trainable_parameters()
 
-    # 检查缓存
     train_index = os.path.join(CONFIG.train_cache, "index.json")
     if not os.path.exists(train_index):
         raise FileNotFoundError(
             f"\n❌ 未找到预处理数据!\n"
-            f"   请先运行: python train.py --preprocess\n"
+            f"   请先运行: python train_v2.py --preprocess\n"
         )
     
-    # 加载数据集
     print_main(f"📂 加载预处理数据...")
     train_dataset = VideoDataset(CONFIG.train_cache)
     
@@ -529,17 +561,15 @@ def train():
     if os.path.exists(eval_index):
         eval_dataset = VideoDataset(CONFIG.eval_cache)
 
-    # 回调函数
     callbacks = [
         TrainingMonitorCallback(),
         SwanLabCallback(
-            project="Qwen2.5-VL-Video-Detection",
-            experiment_name=f"SFT-{datetime.now().strftime('%m%d-%H%M')}",
+            project="Qwen2.5-VL-Video-Detection-v2",
+            experiment_name=f"{CONFIG.loss_mode}-{datetime.now().strftime('%m%d-%H%M')}",
             config={
                 "model": "Qwen2.5-VL-7B",
-                "freeze_vision": CONFIG.freeze_vision,
+                "loss_mode": CONFIG.loss_mode,
                 "lora_r": CONFIG.lora_r,
-                "batch_size": CONFIG.per_device_batch_size * 4 * CONFIG.gradient_accumulation,
                 "learning_rate": CONFIG.learning_rate,
             }
         ),
@@ -553,13 +583,13 @@ def train():
         num_train_epochs=CONFIG.num_epochs,
         learning_rate=CONFIG.learning_rate,
         weight_decay=CONFIG.weight_decay,
-        warmup_steps=CONFIG.warmup_steps,    # ← 用 warmup_steps
+        warmup_steps=CONFIG.warmup_steps,
         lr_scheduler_type="cosine",
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        dataloader_pin_memory=True,          # ← 改为 False
-        dataloader_num_workers=CONFIG.num_workers,             # ← 改为 0
+        dataloader_pin_memory=True,
+        dataloader_num_workers=CONFIG.num_workers,
         logging_steps=CONFIG.logging_steps,
         logging_first_step=True,
         eval_strategy="steps" if eval_dataset else "no",
@@ -588,14 +618,12 @@ def train():
 
     trainer.train()
     
-    # 保存最终模型
     if is_main_process():
-        final_path = f"{CONFIG.output_dir}/final"
-        print(f"\n💾 保存最终模型到: {final_path}")
+        final_path = f"{CONFIG.output_dir}/final-{CONFIG.loss_mode}"
+        print(f"\n💾 保存模型到: {final_path}")
         trainer.save_model(final_path)
         processor.save_pretrained(final_path)
         
-        # 保存训练配置
         with open(f"{final_path}/train_config.json", "w") as f:
             json.dump(vars(CONFIG), f, indent=2, ensure_ascii=False)
         
@@ -611,22 +639,29 @@ if __name__ == "__main__":
         preprocess_data()
     elif "--help" in sys.argv or "-h" in sys.argv:
         print("""
-Qwen2.5-VL 视频检测训练脚本
-===========================
+Qwen2.5-VL 视频检测训练脚本 v2 (创新版)
+========================================
+
+创新点:
+  A) Label Mask 策略: 防止模板记忆
+  B) 多任务学习: Real/Generated + 生成器归因
 
 使用方法:
-  1. 预处理数据 (首次运行):
-     python train.py --preprocess
+  1. 生成 v2 数据 (先运行):
+     python gen_cot_data_v2.py
 
-  2. 开始训练 (4卡):
-     torchrun --nproc_per_node=4 train.py
+  2. 预处理数据:
+     python train_v2.py --preprocess
 
-  3. 单卡训练 (调试):
-     python train.py
+  3. 训练 (选择 loss 模式):
+     torchrun --nproc_per_node=4 train_v2.py --loss_mode full
+     torchrun --nproc_per_node=4 train_v2.py --loss_mode answer_only
+     torchrun --nproc_per_node=4 train_v2.py --loss_mode rationale_dropout --dropout_prob 0.5
 
-选项:
-  --preprocess    预处理数据集
-  --help, -h      显示帮助信息
+Loss 模式说明:
+  - full:              对全部输出计算 loss (baseline)
+  - answer_only:       只对 <answer> 和 <source> 计算 loss
+  - rationale_dropout: 以 dropout_prob 概率丢弃 <think> 的 loss
         """)
     else:
         train()
