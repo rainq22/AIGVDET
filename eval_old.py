@@ -6,7 +6,6 @@ eval_v2.py - 增强版评测脚本
   - 校准分析: 置信度与准确率关系
 """
 import os
-import argparse
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["FORCE_QWENVL_VIDEO_READER"] = "torchvision"
 
@@ -26,19 +25,6 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 DATASET_BASE_DIR = "/data1/srq/Qwen/Qwen2.5-VL/datasets"
 
 
-def resolve_dataset_dir(dataset_dir: str) -> str:
-    if dataset_dir:
-        return dataset_dir
-    if os.environ.get("DATASET_DIR"):
-        return os.environ["DATASET_DIR"]
-    if not os.path.exists(DATASET_BASE_DIR):
-        raise FileNotFoundError(f"Dataset base dir not found: {DATASET_BASE_DIR}")
-    candidates = [d for d in os.listdir(DATASET_BASE_DIR) if os.path.isdir(os.path.join(DATASET_BASE_DIR, d))]
-    if not candidates:
-        raise FileNotFoundError(f"No dataset dirs found in: {DATASET_BASE_DIR}")
-    latest = sorted(candidates)[-1]
-    return os.path.join(DATASET_BASE_DIR, latest)
-
 def get_latest_dataset_dir(base_dir: str) -> str:
     if os.environ.get("DATASET_DIR"):
         return os.environ["DATASET_DIR"]
@@ -51,22 +37,15 @@ def get_latest_dataset_dir(base_dir: str) -> str:
     return os.path.join(base_dir, latest)
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--dataset_dir", default=None, help="Dataset directory containing test_v2.json")
-parser.add_argument("--lora_path", default=None, help="Override LORA_PATH")
-args = parser.parse_args()
-
-DATASET_DIR = resolve_dataset_dir(args.dataset_dir)
+DATASET_DIR = get_latest_dataset_dir(DATASET_BASE_DIR)
 
 OUTPUT_BASE_DIR = "/data1/srq/Qwen/Qwen2.5-VL/eval"
-EVAL_VERSION = "motion"
+EVAL_VERSION = "v2-old"
 EVAL_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M")
 OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, EVAL_VERSION, EVAL_TIMESTAMP)
 
 BASE_MODEL_PATH = "/data/srq/Qwen/Qwen/Qwen2.5-VL-7B-Instruct"
 LORA_PATH = "/data1/srq/Qwen/Qwen2.5-VL/output/Qwen2.5-VL-Video-SFT-v2/final-full"  # 或 final-answer_only
-if args.lora_path:
-    LORA_PATH = args.lora_path
 TEST_JSON = os.path.join(DATASET_DIR, "test_v2.json")  # 使用 v2 数据  # 使用 v2 数据
 MAX_SAMPLES = None
 
